@@ -1,0 +1,12 @@
+%% -*- mode: erlang -*-
+{VSN,
+  [{"0.4.7",
+    [{load_module,jamdb_oracle_tns_encoder,brutal_purge,soft_purge,[]},
+     {load_module,jamdb_oracle_conn,brutal_purge,soft_purge,[]},
+     {load_module,jamdb_oracle,brutal_purge,soft_purge,[]}]},
+   {<<".*">>,[]}],
+ [{"0.4.7",
+   [{load_module,jamdb_oracle_tns_encoder,brutal_purge,soft_purge,[]},
+    {load_module,jamdb_oracle_conn,brutal_purge,soft_purge,[]},
+    {load_module,jamdb_oracle,brutal_purge,soft_purge,[]}]},
+  {<<".*">>,[]}]}.
