@@ -70,12 +70,12 @@ disconnect(State) ->
 -spec disconnect(state(), timeout()) -> {ok, [env()]}.
 disconnect(#oraclient{socket=Socket, env=Env, passwd=Passwd}, 0) ->
     sock_close(Socket),
-    exit(Passwd, ok),
+    is_pid(Passwd) andalso exit(Passwd, ok),
     {ok, Env};
 disconnect(#oraclient{conn_state=connected, socket=Socket, env=Env, passwd=Passwd} = State, _Tout) ->
     _ = send_req(close, State),
     sock_close(Socket),
-    exit(Passwd, ok),
+    is_pid(Passwd) andalso exit(Passwd, ok),
     {ok, Env};
 disconnect(#oraclient{env=Env}, _Tout) ->
     {ok, Env}.
@@ -84,7 +84,7 @@ disconnect(#oraclient{env=Env}, _Tout) ->
 reconnect(#oraclient{passwd=Passwd} = State) ->
     Passwd ! {get, self()},
     {Pass, NewPass} = receive Reply -> Reply end,
-    exit(Passwd, ok),
+    is_pid(Passwd) andalso exit(Passwd, ok),
     {ok, EnvOpts} = disconnect(State, 0),
     Pass2 = if NewPass =/= [] -> NewPass; true -> Pass end,
     connect([{password, Pass2}|EnvOpts]).
