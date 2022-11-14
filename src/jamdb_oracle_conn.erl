@@ -5,6 +5,8 @@
 -export([reconnect/1]).
 -export([disconnect/1, disconnect/2]).
 -export([sql_query/2, sql_query/3]).
+-export([get_max_cursors_number/0, set_max_cursors_number/1]).
+-export([reset_cursors/1]).
 
 -include("jamdb_oracle.hrl").
 
@@ -26,6 +28,21 @@
 
 -export_type([state/0]).
 -export_type([options/0]).
+
+-define(DEFAULT_MAX_CURSORS, 127).
+-define(PK_MAX_CURSORS, {?MODULE, max_cursors_number}).
+-define(BUFF(KEY), {buffer, KEY}).
+
+get_max_cursors_number() ->
+    persistent_term:get(?PK_MAX_CURSORS, ?DEFAULT_MAX_CURSORS).
+
+set_max_cursors_number(Num) when is_integer(Num), Num >= 1 ->
+    persistent_term:put(?PK_MAX_CURSORS, Num);
+set_max_cursors_number(Num) ->
+    throw({invalid_max_cursors_number, Num}).
+
+reset_cursors(State) ->
+    send_req(reset, State).
 
 %% API
 -spec connect([env()]) -> empty_result().
@@ -51,11 +68,11 @@ connect(Opts, Tout) ->
     Pass        = proplists:get_value(password, Opts),
     NewPass     = proplists:get_value(newpassword, Opts, []),
     EnvOpts     = proplists:delete(password, proplists:delete(newpassword, Opts)),
-    Passwd = spawn(fun() -> loop({Pass, NewPass}) end),
+    jamdb_oracle_buffer:set(?BUFF(passwd), {Pass, NewPass}),
     case gen_tcp:connect(Host, Port, SockOpts, Tout) of
         {ok, Socket} ->
             {ok, Socket2} = sock_connect(Socket, SslOpts, Tout),
-            State = #oraclient{socket=Socket2, env=EnvOpts, passwd=Passwd, auth=Desc,
+            State = #oraclient{socket=Socket2, env=EnvOpts, passwd=?BUFF(passwd), auth=Desc,
             auto=Auto, fetch=Fetch, sdu=Sdu, charset=Charset, timeouts={Tout, ReadTout}},
             {ok, State2} = send_req(login, State),
             handle_login(State2#oraclient{conn_state=auth_negotiate});
@@ -70,21 +87,20 @@ disconnect(State) ->
 -spec disconnect(state(), timeout()) -> {ok, [env()]}.
 disconnect(#oraclient{socket=Socket, env=Env, passwd=Passwd}, 0) ->
     sock_close(Socket),
-    is_pid(Passwd) andalso exit(Passwd, ok),
+    jamdb_oracle_buffer:del(Passwd),
     {ok, Env};
 disconnect(#oraclient{conn_state=connected, socket=Socket, env=Env, passwd=Passwd} = State, _Tout) ->
     _ = send_req(close, State),
     sock_close(Socket),
-    is_pid(Passwd) andalso exit(Passwd, ok),
+    jamdb_oracle_buffer:del(Passwd),
     {ok, Env};
 disconnect(#oraclient{env=Env}, _Tout) ->
     {ok, Env}.
 
 -spec reconnect(state()) -> empty_result().
 reconnect(#oraclient{passwd=Passwd} = State) ->
-    Passwd ! {get, self()},
-    {Pass, NewPass} = receive Reply -> Reply end,
-    is_pid(Passwd) andalso exit(Passwd, ok),
+    {Pass, NewPass} = jamdb_oracle_buffer:get(Passwd),
+    jamdb_oracle_buffer:del(Passwd),
     {ok, EnvOpts} = disconnect(State, 0),
     Pass2 = if NewPass =/= [] -> NewPass; true -> Pass end,
     connect([{password, Pass2}|EnvOpts]).
@@ -126,9 +142,6 @@ sql_query(#oraclient{conn_state=connected, timeouts={_Tout, ReadTout}} = State, 
         _ -> {ok, undefined, State}
     end.
 
-loop(Values) ->
-    receive {get, From} -> From ! Values, loop(Values); {set, Values2} -> loop(Values2) end.
-
 %% internal
 handle_login(#oraclient{socket=Socket, env=Env, sdu=Length, timeouts=Touts} = State) ->
     case recv(Socket, Length, Touts) of
@@ -145,8 +158,8 @@ handle_login(#oraclient{socket=Socket, env=Env, sdu=Length, timeouts=Touts} = St
             {ok, State2} = send_req(login, State#oraclient{socket=Socket2}),
             handle_login(State2);
         {ok, ?TNS_ACCEPT, <<_Ver:16,_Opts:16,Sdu:16,_Rest/bits>> = _BinaryData} ->
-            Task = spawn(fun() -> loop(0) end),
-            {ok, State2} = send_req(pro, State#oraclient{seq=Task,sdu=Sdu}),
+            jamdb_oracle_buffer:set(?BUFF(seq), 0),
+            {ok, State2} = send_req(pro, State#oraclient{seq=?BUFF(seq),sdu=Sdu}),
             handle_login(State2);
         {ok, ?TNS_MARKER, _BinaryData} ->
             handle_req(marker, State, []);
@@ -166,9 +179,9 @@ handle_token(<<Token, Data/binary>>, State) ->
                     send_req(auth, State#oraclient{req=Request});
                 {?TTI_AUTH, Resp, Ver, SessId} ->
                     #oraclient{auth = KeyConn} = State,
-                    Cursors = spawn(fun() -> loop([]) end),
+                    jamdb_oracle_buffer:set(?BUFF(cursors), []),
                     case jamdb_oracle_crypt:validate(#logon{auth=Resp, key=KeyConn}) of
-                        ok -> State#oraclient{conn_state=connected,auth=SessId,server=Ver,cursors=Cursors};
+                        ok -> State#oraclient{conn_state=connected,auth=SessId,server=Ver,cursors=?BUFF(cursors)};
                         error -> handle_error(remote, Resp, State)
                     end
             end;
@@ -214,18 +227,18 @@ send_req(auth, #oraclient{req=Request,seq=Task} = State) ->
     {Data, KeyConn} = get_record(auth, State, Request, Task),
     send(State#oraclient{auth=KeyConn,req=[]}, ?TNS_DATA, Data);
 send_req(close, #oraclient{server=0,seq=Task} = State) ->
-    exit(Task, ok),
+    jamdb_oracle_buffer:del(Task),
     send(State, ?TNS_DATA, <<64>>);
 send_req(close, #oraclient{auto=0} = State) ->
     _ = handle_req(tran, State, ?TTI_ROLLBACK),
     send_req(close, State#oraclient{auto=1});
 send_req(close, #oraclient{cursors=Cursors} = State) ->
     _ = handle_req(pig, State, {close, 0}),
-    exit(Cursors, ok),
+    jamdb_oracle_buffer:del(Cursors),
     send_req(close, State#oraclient{server=0});
 send_req(reset, #oraclient{cursors=Cursors} = State) ->
     handle_req(pig, State, {tran, ?TTI_PING}),
-    Cursors ! {set, []};
+    jamdb_oracle_buffer:set(Cursors, []);
 send_req(Type, #oraclient{req=Request,seq=Task} = State) ->
     Data = get_record(Type, State, Request, Task),
     send(State, ?TNS_DATA, Data).
@@ -276,20 +289,20 @@ handle_resp(Data, Acc, #oraclient{type=Type, cursors=Cursors} = State) ->
             #oraclient{auto=Auto, defcols=DefCol} = State2,
             {_, Result} = get_result(Auto, DefCol, {LCursor, Cursor, RowFormat}, Cursors),
             handle_resp({Cursor, RowFormat, []}, State2#oraclient{defcols=Result, type=Type2});
-            {RetCode, RowNumber, Cursor, {LCursor, RowFormat}, Rows} ->
+        {RetCode, RowNumber, Cursor, {LCursor, RowFormat}, Rows} ->
             case get_result(Type, RetCode, RowNumber, RowFormat, Rows) of
                 more when Type =:= fetch ->
                     {ok, [{fetched_rows, Cursor, RowFormat, Rows}], State};
                 more ->
                     {ok, State2} = send_req(fetch, State, Cursor),
                     handle_resp({Cursor, RowFormat, Rows}, State2);
-                {ok, _} = Result ->
+                {ok, Result} ->
                     #oraclient{auto=Auto, defcols=DefCol} = State,
                     case get_result(Auto, DefCol, {LCursor, Cursor, RowFormat}, Cursors) of
                         {reset, _} -> send_req(reset, State);
                         _ -> more
                     end,
-                    erlang:append_element(Result, State);
+                    {ok, Result, State};
                 {error, Result} ->
                     case get_result(Cursors) of
                         [] -> more;
@@ -326,22 +339,29 @@ get_result(_Type, _RetCode, _RowNumber, _RowFormat, _Rows) ->
     more.
 
 get_result(undefined) -> [];
-get_result(Cursors) when is_pid(Cursors) -> Cursors ! {get, self()}, receive Reply -> Reply end;
+get_result(?BUFF(_) = Cursors) ->
+    jamdb_oracle_buffer:get(Cursors);
 get_result(#format{column_name=Column}) -> Column.
 
-get_result(Auto, {Sum, {0, _Cursor, _RowFormat}}, Result, Cursors) when is_pid(Cursors) ->
+get_result(Auto, {Sum, {0, _Cursor, _RowFormat}}, Result, ?BUFF(_) = Cursors) ->
     Acc = get_result(Cursors),
     DefCol = {Sum, Result},
-    case length(Acc) > 127 of
-        true when Auto =:= 1 -> {reset, DefCol};
-        _ -> Cursors ! {set, [DefCol|Acc]}, {more, DefCol}
+    case length(Acc) > get_max_cursors_number() of
+        true when Auto =:= 1 ->
+            {reset, DefCol};
+        _ ->
+            jamdb_oracle_buffer:set(Cursors, [DefCol|Acc]),
+            {more, DefCol}
     end;
 get_result(_Auto, DefCol, _Result, _Cursors) -> {more, DefCol}.
 
-get_param(Task) when is_pid(Task) ->
-    Task ! {get, self()},
-    Tseq = receive 127 -> 0; Reply -> Reply end,
-    Task ! {set, Tseq + 1}, Tseq + 1;
+get_param(?BUFF(_) = Task) ->
+    Tseq = case jamdb_oracle_buffer:get(Task) of
+        127 -> 0;
+        Val -> Val
+    end,
+    jamdb_oracle_buffer:set(Task, Tseq + 1),
+    Tseq + 1;
 get_param(Tseq) -> Tseq.
 
 get_param([], _M, Acc) -> Acc;
@@ -353,7 +373,7 @@ get_param(Type, Data, Format) when is_atom(Type) ->
     {<<>>, DataType, Length, Scale, Charset} = ?DECODER:decode_helper(param, Data, Format),
     #format{param=Type,data_type=DataType,data_length=Length,data_scale=Scale,charset=Charset}.
 
-get_param(defcols, {Sum, Cursors}) when is_pid(Cursors) ->
+get_param(defcols, {Sum, ?BUFF(_) = Cursors}) ->
     Acc = get_result(Cursors),
     {Sum, proplists:get_value(Sum, Acc, {0,0,[]})};
 get_param(defcols, {_Sum, {LCursor, Cursor, _RowFormat}}) when LCursor =:= Cursor -> {LCursor, 0};

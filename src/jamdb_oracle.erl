@@ -6,6 +6,7 @@
 -export([start_link/1, start/1]).
 -export([stop/1]).
 -export([sql_query/2, sql_query/3]).
+-export([reset_cursors/1]).
 
 %% gen_server callbacks
 -export([init/1, terminate/2]).
@@ -31,6 +32,9 @@ sql_query(Pid, Query, _Tout) ->
 sql_query(Pid, Query) ->
     call_infinity(Pid, {sql_query, Query}).
 
+reset_cursors(Pid) ->
+    call_infinity(Pid, reset_cursors).
+
 %% gen_server callbacks
 init(Opts) ->
     case jamdb_oracle_conn:connect(Opts) of
@@ -42,16 +46,21 @@ init(Opts) ->
             {stop, {Type, Result}}
     end.
 
+handle_call(reset_cursors, _From, State) ->
+    _ = jamdb_oracle_conn:reset_cursors(State),
+    {reply, ok, State};
+
 %% Error types: socket, remote, local
 handle_call({sql_query, Query}, _From, State) ->
     try jamdb_oracle_conn:sql_query(State, Query) of
-        {ok, Result, State2} -> 
+        {ok, Result, State2} ->
             {reply, {ok, Result}, State2};
         {error, Type, Reason, State2} ->
             {reply, {error, Type, Reason}, State2}
     catch
-        error:Reason ->
-            {reply, {error, local, Reason}, State}
+        error:Reason:ST ->
+            logger:error("sql_query_failed, reason: ~p, stacktrace: ~0p", [Reason, ST]),
+            {reply, {error, local, sql_query_failed}, State}
     end;
 handle_call(stop, _From, State) ->
     {ok, _InitOpts} = jamdb_oracle_conn:disconnect(State),
