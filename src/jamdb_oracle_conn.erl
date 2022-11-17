@@ -36,7 +36,7 @@
 get_max_cursors_number() ->
     persistent_term:get(?PK_MAX_CURSORS, ?DEFAULT_MAX_CURSORS).
 
-set_max_cursors_number(Num) when is_integer(Num), Num >= 1 ->
+set_max_cursors_number(Num) when is_integer(Num), Num > 0 ->
     persistent_term:put(?PK_MAX_CURSORS, Num);
 set_max_cursors_number(Num) ->
     throw({invalid_max_cursors_number, Num}).
@@ -140,7 +140,9 @@ sql_query(#oraclient{conn_state=connected, timeouts={_Tout, ReadTout}} = State, 
         "TIMEOUT" -> {ok, [], State#oraclient{timeouts={hd(Bind), ReadTout}}};
         "FETCH" -> {ok, [], State#oraclient{fetch=hd(Bind)}};
         _ -> {ok, undefined, State}
-    end.
+    end;
+sql_query(#oraclient{conn_state=disconnected} = State, _) ->
+    handle_error(remote, disconnected, State).
 
 %% internal
 handle_login(#oraclient{socket=Socket, env=Env, sdu=Length, timeouts=Touts} = State) ->
@@ -304,9 +306,10 @@ handle_resp(Data, Acc, #oraclient{type=Type, cursors=Cursors} = State) ->
                     end,
                     {ok, Result, State};
                 {error, Result} ->
-                    case get_result(Cursors) of
-                        [] -> more;
-                        _ -> send_req(reset, State)
+                    #oraclient{auto=Auto, defcols=DefCol} = State,
+                    case get_result(Auto, DefCol, {LCursor, Cursor, RowFormat}, Cursors) of
+                        {reset, _} -> send_req(reset, State);
+                        _ -> more
                     end,
                     {ok, Result, State}
             end;
@@ -346,11 +349,11 @@ get_result(#format{column_name=Column}) -> Column.
 get_result(Auto, {Sum, {0, _Cursor, _RowFormat}}, Result, ?BUFF(_) = Cursors) ->
     Acc = get_result(Cursors),
     DefCol = {Sum, Result},
+    jamdb_oracle_buffer:set(Cursors, [DefCol|Acc]),
     case length(Acc) > get_max_cursors_number() of
         true when Auto =:= 1 ->
             {reset, DefCol};
         _ ->
-            jamdb_oracle_buffer:set(Cursors, [DefCol|Acc]),
             {more, DefCol}
     end;
 get_result(_Auto, DefCol, _Result, _Cursors) -> {more, DefCol}.
