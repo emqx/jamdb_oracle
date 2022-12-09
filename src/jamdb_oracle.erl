@@ -55,10 +55,12 @@ handle_call({sql_query, Query}, _From, State) ->
     try jamdb_oracle_conn:sql_query(State, Query) of
         {ok, Result, State2} ->
             {reply, {ok, Result}, State2};
+        {error, socket, Reason, State2} ->
+            {stop, {shutdown, socket_error}, {error, socket, Reason}, State2};
+        {error, remote, disconnected, State2} ->
+            {stop, normal, {error, remote, disconnected}, State2};
         {error, Type, Reason, State2} ->
-            {reply, {error, Type, Reason}, State2};
-        {error, remote, disconnected, State} ->
-            {stop, normal, {error, remote, disconnected}, State}
+            {reply, {error, Type, Reason}, State2}
     catch
         error:Reason:ST ->
             logger:error("sql_query_failed, reason: ~p, stacktrace: ~0p", [Reason, ST]),
