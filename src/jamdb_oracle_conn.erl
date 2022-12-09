@@ -119,13 +119,18 @@ sql_query(State, {batch, Query, [Bind|Batch]}) ->
 sql_query(State, {fetch, Query, Bind}) ->
     sql_query(State, {Query, Bind, [], fetch});
 sql_query(#oraclient{conn_state=connected} = State, {fetch, Cursor, RowFormat, LastRow}) ->
-    {ok, State2} = send_req(fetch, State#oraclient{type=fetch}, Cursor),
-    handle_resp({Cursor, RowFormat, [LastRow]}, State2);
+    case send_req(fetch, State#oraclient{type=fetch}, Cursor) of
+        {ok, State2} -> handle_resp({Cursor, RowFormat, [LastRow]}, State2);
+        Err -> Err
+    end;
 sql_query(#oraclient{conn_state=connected} = State, {Query, Bind, Batch, Fetch}) ->
-    {ok, State2} = send_req(exec, State, {Query, Bind, Batch}),
-    #oraclient{server=Ver, defcols=DefCol, params=RowFormat, type=Type} = State2,
-    handle_resp(get_param(defcols, {DefCol, Ver, RowFormat, Type}),
-    State2#oraclient{type=get_param(type, {Type, Fetch})});
+    case send_req(exec, State, {Query, Bind, Batch}) of
+        {ok, State2} ->
+            #oraclient{server=Ver, defcols=DefCol, params=RowFormat, type=Type} = State2,
+            handle_resp(get_param(defcols, {DefCol, Ver, RowFormat, Type}),
+            State2#oraclient{type=get_param(type, {Type, Fetch})});
+        Err -> Err
+    end;
 sql_query(#oraclient{conn_state=connected, timeouts={_Tout, ReadTout}} = State, {Query, Bind}) ->
     case lists:nth(1, string:tokens(string:to_upper(Query)," \t;")) of
         "SESSION" -> sql_query(State, {?ENCODER:encode_helper(sess, []), [], [], []});
@@ -166,7 +171,7 @@ handle_login(#oraclient{socket=Socket, env=Env, sdu=Length, timeouts=Touts} = St
         {ok, ?TNS_MARKER, _BinaryData} ->
             handle_req(marker, State, []);
         {ok, ?TNS_REFUSE, _BinaryData} ->
-            handle_error(local, Env, State);
+            handle_error(local, refused_by_oracle, State);
         {error, Type, Reason} ->
             handle_error(Type, Reason, State)
     end.
