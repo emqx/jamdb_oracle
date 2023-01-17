@@ -56,15 +56,18 @@ handle_call({sql_query, Query}, _From, State) ->
         {ok, Result, State2} ->
             {reply, {ok, Result}, State2};
         {error, socket, Reason, State2} ->
-            {stop, {shutdown, socket_error}, {error, socket, Reason}, State2};
+            {stop, {shutdown, {socket_error, Reason}}, {error, socket, Reason}, State2};
         {error, remote, disconnected, State2} ->
             {stop, normal, {error, remote, disconnected}, State2};
         {error, Type, Reason, State2} ->
             {reply, {error, Type, Reason}, State2}
     catch
         error:Reason:ST ->
+            %% We stop the process here, so the high level ecpool will restart
+            %% it (and thus re-init the state). This make sure the state is
+            %% correct and match with the code after relup.
             logger:error("sql_query_failed, reason: ~p, stacktrace: ~0p", [Reason, ST]),
-            {reply, {error, local, sql_query_failed}, State}
+            {stop, {shutdown, Reason}, {error, local, sql_query_failed}, State}
     end;
 handle_call(stop, _From, State) ->
     {ok, _InitOpts} = jamdb_oracle_conn:disconnect(State),
