@@ -68,11 +68,11 @@ connect(Opts, Tout) ->
     Pass        = proplists:get_value(password, Opts),
     NewPass     = proplists:get_value(newpassword, Opts, []),
     EnvOpts     = proplists:delete(password, proplists:delete(newpassword, Opts)),
-    jamdb_oracle_buffer:set(?BUFF(passwd), {Pass, NewPass}),
+    Passwd = jamdb_secret:wrap({jamdb_secret:unwrap(Pass), jamdb_secret:unwrap(NewPass)}),
     case gen_tcp:connect(Host, Port, SockOpts, Tout) of
         {ok, Socket} ->
             {ok, Socket2} = sock_connect(Socket, SslOpts, Tout),
-            State = #oraclient{socket=Socket2, env=EnvOpts, passwd=?BUFF(passwd), auth=Desc,
+            State = #oraclient{socket=Socket2, env=EnvOpts, passwd=Passwd, auth=Desc,
             auto=Auto, fetch=Fetch, sdu=Sdu, charset=Charset, timeouts={Tout, ReadTout}},
             {ok, State2} = send_req(login, State),
             handle_login(State2#oraclient{conn_state=auth_negotiate});
@@ -85,21 +85,19 @@ disconnect(State) ->
     disconnect(State, 1).
 
 -spec disconnect(state(), timeout()) -> {ok, [env()]}.
-disconnect(#oraclient{socket=Socket, env=Env, passwd=Passwd}, 0) ->
+disconnect(#oraclient{socket=Socket, env=Env}, 0) ->
     sock_close(Socket),
-    jamdb_oracle_buffer:del(Passwd),
     {ok, Env};
-disconnect(#oraclient{conn_state=connected, socket=Socket, env=Env, passwd=Passwd} = State, _Tout) ->
+disconnect(#oraclient{conn_state=connected, socket=Socket, env=Env} = State, _Tout) ->
     _ = send_req(close, State),
     sock_close(Socket),
-    jamdb_oracle_buffer:del(Passwd),
     {ok, Env};
 disconnect(#oraclient{env=Env}, _Tout) ->
     {ok, Env}.
 
 -spec reconnect(state()) -> empty_result().
 reconnect(#oraclient{passwd=Passwd} = State) ->
-    {Pass, NewPass} = jamdb_oracle_buffer:get(Passwd),
+    {Pass, NewPass} = jamdb_secret:unwrap(Passwd),
     jamdb_oracle_buffer:del(Passwd),
     {ok, EnvOpts} = disconnect(State, 0),
     Pass2 = if NewPass =/= [] -> NewPass; true -> Pass end,

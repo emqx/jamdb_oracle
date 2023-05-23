@@ -86,7 +86,7 @@ encode_record(auth, #oraclient{env=EnvOpts,passwd=Passwd,req=Request,seq=Tseq}) 
     User            = proplists:get_value(user, EnvOpts),
     Role            = proplists:get_value(role, EnvOpts, 0),
     Prelim          = proplists:get_value(prelim, EnvOpts, 0),
-    {Pass, NewPass} = jamdb_oracle_buffer:get(Passwd),
+    {Pass, NewPass} = jamdb_secret:unwrap(Passwd),
     User2 = encode_str(User),
     Pass2 = binary_to_list(encode_str(Pass)),
     NewPass2 = binary_to_list(encode_str(NewPass)),
