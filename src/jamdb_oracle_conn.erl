@@ -8,6 +8,10 @@
 -export([get_max_cursors_number/0, set_max_cursors_number/1]).
 -export([reset_cursors/1]).
 
+-ifdef(TEST).
+-export([bind_param_names/1]).
+-endif.
+
 -include("jamdb_oracle.hrl").
 
 -opaque state() :: #oraclient{}.
@@ -121,12 +125,15 @@ sql_query(#oraclient{conn_state=connected} = State, {fetch, Cursor, RowFormat, L
         {ok, State2} -> handle_resp({Cursor, RowFormat, [LastRow]}, State2);
         Err -> Err
     end;
-sql_query(#oraclient{conn_state=connected} = State, {Query, Bind, Batch, Fetch}) ->
+sql_query(#oraclient{conn_state=connected} = State, {Query, Bind0, Batch0, Fetch}) ->
+    {Bind, Batch} = normalize_bind_rows(Query, Bind0, Batch0),
     case send_req(exec, State, {Query, Bind, Batch}) of
         {ok, State2} ->
             #oraclient{server=Ver, defcols=DefCol, params=RowFormat, type=Type} = State2,
-            handle_resp(get_param(defcols, {DefCol, Ver, RowFormat, Type}),
-            State2#oraclient{type=get_param(type, {Type, Fetch})});
+            handle_resp(
+                get_param(defcols, {DefCol, Ver, RowFormat, Type}),
+                State2#oraclient{type=get_param(type, {Type, Fetch})}
+            );
         Err -> Err
     end;
 sql_query(#oraclient{conn_state=connected, timeouts={_Tout, ReadTout}} = State, {Query, Bind}) ->
@@ -255,21 +262,23 @@ send_req(fetch, #oraclient{seq=Task} = State, Cursor) ->
     Data = get_record(fetch, State, Cursor, Task),
     send(State, ?TNS_DATA, Data);
 send_req(exec, State, {Query, Bind, Batch}) when is_map(Bind) ->
-    Data = lists:filtermap(fun(L) -> case string:chr(L, $:) of 0 -> false; I -> {true, lists:nthtail(I, L)} end end,
-        string:tokens(Query," \t;,)")),
-    send_req(exec, State, {Query, get_param(Data, Bind, []), [get_param(Data, B, []) || B <- Batch]});
+    {Bind2, Batch2} = normalize_bind_rows(Query, Bind, Batch),
+    send_req(exec, State, {Query, Bind2, Batch2});
 send_req(exec, #oraclient{charset=Charset,fetch=Fetch,cursors=Cursors,seq=Task} = State, {Query, Bind, Batch}) ->
     KeyWord = lists:nth(1, string:tokens(string:to_upper(Query)," \t\r\n")),
     {Select, Change} = ?ENCODER:encode_helper(type, KeyWord),
     {Type, Fetch2} = get_param(type, {Select, Change, [B || {out, B} <- Bind], Fetch}),
-    Sum = erlang:crc32(?ENCODER:encode_str(Query)),
+    BindFormat = get_bind_format(Charset, [Bind | Batch]),
+    Sum = erlang:crc32(term_to_binary({?ENCODER:encode_str(Query), bind_format_signature(BindFormat)})),
     DefCol = get_param(defcols, {Sum, Cursors}),
     {LCursor, Cursor} = get_param(defcols, DefCol),
     Pig = if Cursor =/= 0 -> get_record(pig, [], {?TTI_CANA, [Cursor]}, Task); true -> <<>> end,
     Pig2 = if Cursor =/= 0 -> get_record(pig, [], {?TTI_OCCA, [Cursor]}, Task); true -> <<>> end,
+    BindData = [get_param(data, B) || B <- Bind],
+    BatchData = [[get_param(data, B) || B <- Row] || Row <- Batch],
     Data = get_record(exec, State#oraclient{type=Type,fetch=Fetch2}, {LCursor, if LCursor =:= 0 -> Query; true -> [] end,
-        [get_param(data, B) || B <- Bind], Batch, []}, Task),
-    send(State#oraclient{type=Type,defcols=DefCol,params=[get_param(format, B, #format{charset=Charset}) || B <- Bind]},
+        BindData, BatchData, [], BindFormat}, Task),
+    send(State#oraclient{type=Type,defcols=DefCol,params=BindFormat},
         ?TNS_DATA, <<Pig/binary, Pig2/binary, Data/binary>>).
 
 handle_resp(Acc, #oraclient{socket=Socket, sdu=Length, timeouts=Touts} = State) ->
@@ -399,6 +408,125 @@ get_param(type, {Type, []}) -> Type;
 get_param(data, {out, Data}) -> ?ENCODER:encode_helper(param, Data);
 get_param(data, {in, Data}) -> Data;
 get_param(data, Data) -> Data.
+
+normalize_bind_rows(Query, Bind, Batch) when is_map(Bind) ->
+    ParamNames = bind_param_names(Query),
+    {get_param(ParamNames, Bind, []), [get_param(ParamNames, B, []) || B <- Batch]};
+normalize_bind_rows(_Query, Bind, Batch) ->
+    {Bind, Batch}.
+
+bind_param_names(Query) ->
+    bind_param_names(Query, normal, []).
+
+%% Extract map-bind names in SQL order while ignoring quoted/commented text.
+bind_param_names([], _State, Acc) ->
+    lists:reverse(Acc);
+bind_param_names([$q, $', Delimiter|Rest], normal, Acc) ->
+    bind_param_names(Rest, {q_quote, q_quote_end(Delimiter)}, Acc);
+bind_param_names([$Q, $', Delimiter|Rest], normal, Acc) ->
+    bind_param_names(Rest, {q_quote, q_quote_end(Delimiter)}, Acc);
+bind_param_names([$'|Rest], normal, Acc) ->
+    bind_param_names(Rest, single_quote, Acc);
+bind_param_names([$"|Rest], normal, Acc) ->
+    bind_param_names(Rest, double_quote, Acc);
+bind_param_names([$-, $-|Rest], normal, Acc) ->
+    bind_param_names(Rest, line_comment, Acc);
+bind_param_names([$/, $*|Rest], normal, Acc) ->
+    bind_param_names(Rest, block_comment, Acc);
+bind_param_names([$:, $=|Rest], normal, Acc) ->
+    bind_param_names(Rest, normal, Acc);
+bind_param_names([$:|Rest], normal, Acc) ->
+    {Name, Rest2} = read_bind_name(Rest, []),
+    case Name of
+        [] -> bind_param_names(Rest2, normal, Acc);
+        _ -> bind_param_names(Rest2, normal, [Name|Acc])
+    end;
+bind_param_names([_|Rest], normal, Acc) ->
+    bind_param_names(Rest, normal, Acc);
+bind_param_names([$',$'|Rest], single_quote, Acc) ->
+    bind_param_names(Rest, single_quote, Acc);
+bind_param_names([$'|Rest], single_quote, Acc) ->
+    bind_param_names(Rest, normal, Acc);
+bind_param_names([_|Rest], single_quote, Acc) ->
+    bind_param_names(Rest, single_quote, Acc);
+bind_param_names([$",$"|Rest], double_quote, Acc) ->
+    bind_param_names(Rest, double_quote, Acc);
+bind_param_names([$"|Rest], double_quote, Acc) ->
+    bind_param_names(Rest, normal, Acc);
+bind_param_names([_|Rest], double_quote, Acc) ->
+    bind_param_names(Rest, double_quote, Acc);
+bind_param_names([$\n|Rest], line_comment, Acc) ->
+    bind_param_names(Rest, normal, Acc);
+bind_param_names([$\r|Rest], line_comment, Acc) ->
+    bind_param_names(Rest, normal, Acc);
+bind_param_names([_|Rest], line_comment, Acc) ->
+    bind_param_names(Rest, line_comment, Acc);
+bind_param_names([$*, $/|Rest], block_comment, Acc) ->
+    bind_param_names(Rest, normal, Acc);
+bind_param_names([_|Rest], block_comment, Acc) ->
+    bind_param_names(Rest, block_comment, Acc);
+bind_param_names([End, $'|Rest], {q_quote, End}, Acc) ->
+    bind_param_names(Rest, normal, Acc);
+bind_param_names([_|Rest], {q_quote, End}, Acc) ->
+    bind_param_names(Rest, {q_quote, End}, Acc).
+
+read_bind_name([Char|Rest], Acc) when
+    $a =< Char, Char =< $z;
+    $A =< Char, Char =< $Z;
+    $0 =< Char, Char =< $9;
+    Char =:= $_;
+    Char =:= $$;
+    Char =:= $#
+->
+    read_bind_name(Rest, [Char|Acc]);
+read_bind_name(Rest, Acc) ->
+    {lists:reverse(Acc), Rest}.
+
+q_quote_end($[) -> $];
+q_quote_end(${) -> $};
+q_quote_end($() -> $);
+q_quote_end($<) -> $>;
+q_quote_end(Char) -> Char.
+
+get_bind_format(Charset, Rows) ->
+    Format = #format{charset=Charset},
+    merge_bind_format([[get_param(format, B, Format) || B <- Row] || Row <- Rows]).
+
+merge_bind_format([]) ->
+    [];
+merge_bind_format([BindFormat | Rest]) ->
+    lists:foldl(fun merge_bind_format/2, BindFormat, Rest).
+
+merge_bind_format(BindFormat, Acc) ->
+    [merge_format(L, R) || {L, R} <- lists:zip(Acc, BindFormat)].
+
+merge_format(#format{data_type=DataType} = Format, #format{data_type=DataType} = Other) ->
+    Format#format{
+        data_length = max_format_value(Format#format.data_length, Other#format.data_length),
+        data_scale = max_format_value(Format#format.data_scale, Other#format.data_scale)
+    };
+merge_format(#format{data_type=?TNS_TYPE_VARCHAR, data_length=4000}, Other) ->
+    Other;
+merge_format(Format, #format{data_type=?TNS_TYPE_VARCHAR, data_length=4000}) ->
+    Format;
+merge_format(Format, Other) ->
+    case max_format_value(Format#format.data_length, 0) >= max_format_value(Other#format.data_length, 0) of
+        true -> Format;
+        false -> Other
+    end.
+
+max_format_value(undefined, Value) ->
+    Value;
+max_format_value(Value, undefined) ->
+    Value;
+max_format_value(Left, Right) ->
+    max(Left, Right).
+
+bind_format_signature(BindFormat) ->
+    [
+        {Type, Length, Scale, Charset}
+     || #format{data_type=Type, data_length=Length, data_scale=Scale, charset=Charset} <- BindFormat
+    ].
 
 get_record(Type, [], Request, Task) ->
     ?ENCODER:encode_record(Type, #oraclient{req=Request, seq=get_param(Task)});

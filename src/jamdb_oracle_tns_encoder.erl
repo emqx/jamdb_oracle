@@ -186,7 +186,9 @@ encode_record(fetch, #oraclient{fetch=Fetch,req=Cursor,seq=Tseq}) ->
     (encode_sb4(Cursor))/binary,    %cursor
     (encode_sb4(Fetch))/binary      %rows to fetch
     >>;
-encode_record(exec, #oraclient{type=Type,auto=Auto,charset=Charset,fetch=Fetch,server=Ver,req={Cursor,Query,Bind,Batch,Def},seq=Tseq}) ->
+encode_record(exec, #oraclient{req={Cursor, Query, Bind, Batch, Def}} = State) ->
+    encode_record(exec, State#oraclient{req={Cursor, Query, Bind, Batch, Def, []}});
+encode_record(exec, #oraclient{type=Type,auto=Auto,charset=Charset,fetch=Fetch,server=Ver,req={Cursor,Query,Bind,Batch,Def,BindFormat},seq=Tseq}) ->
     QueryData = encode_str(Query),
     QueryLen = if Cursor =/= 0 -> 0; true -> byte_size(QueryData) end,
     BindLen = length(Bind),
@@ -235,7 +237,7 @@ encode_record(exec, #oraclient{type=Type,auto=Auto,charset=Charset,fetch=Fetch,s
     (case {BindLen, DefLen, QueryLen} of
         {0, 0, QueryLen} -> <<>>;
         {BindLen, 0, 0} -> encode_token(rxd, [Bind|Batch], <<>>);
-        {BindLen, 0, QueryLen} -> encode_token(rxd, [Bind|Batch], encode_token(oac, Bind, #format{charset=Charset}, <<>>));
+        {BindLen, 0, QueryLen} -> encode_token(rxd, [Bind|Batch], encode_token(oac, bind_format(Bind, BindFormat), #format{charset=Charset}, <<>>));
         {0, DefLen, 0} -> encode_token(oac, Def, #format{charset=Charset}, <<>>)
     end)/binary
     >>;
@@ -254,8 +256,14 @@ encode_record(close, #oraclient{seq=Tseq}) ->
     >>.
 
 setopts(all8, {Opts, Fetch, Type}) -> [Opts,Fetch,0,0,0,0,0,Type,0,0,0,0,0];
-setopts(size, Data) when length(Data) > 4000 -> 33554432;  %clob
-setopts(size, _Data) -> 4000.
+setopts(size, Data) ->
+    case byte_size(encode_str(Data)) > 4000 of
+        true -> 33554432;  %clob
+        false -> 4000
+    end.
+
+bind_format(Bind, []) -> Bind;
+bind_format(_Bind, BindFormat) -> BindFormat.
 
 setopts(fetch, DefInd, _BatchLen, Fetch) ->
     {32832 bor (DefInd * 16), 0, 2147483647, setopts(all8, {0, Fetch, 1})};
@@ -304,6 +312,9 @@ encode_token(oac, [Data|Rest], Format, Acc) when is_record(Data, format), is_bin
     encode_token(oac, Rest, Format, <<Acc/binary, (encode_token(oac, Data, Format,[]))/binary>>);
 encode_token(oac, [Data|Rest], Format, Acc) when is_binary(Acc) ->
     encode_token(oac, Rest, Format, <<Acc/binary, (encode_token(oac, Data, Format))/binary>>);
+encode_token(oac, #format{data_type=DataType,data_length=Length,charset=Charset}, _, Acc)
+when is_list(Acc), ?IS_CHAR_TYPE(DataType), Length > 4000 ->
+    encode_token(oac, ?TNS_TYPE_VARCHAR, Length, 16, Charset, 0);
 encode_token(oac, #format{data_type=DataType,charset=Charset}, _, Acc) when is_list(Acc), ?IS_CHAR_TYPE(DataType) ->
     encode_token(oac, ?TNS_TYPE_VARCHAR, 4000, 16, Charset, 0);
 encode_token(oac, #format{data_type=DataType,charset=Charset}, _, Acc) when is_list(Acc), ?IS_LOB_TYPE(DataType) ->

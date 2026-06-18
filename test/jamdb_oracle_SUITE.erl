@@ -51,7 +51,11 @@ groups() ->
         {lob_datatypes, [sequence], [
             t_clob,
             t_blob,
-            t_nclob            
+            t_nclob,
+            t_nclob_bind_size_changes,
+            t_nclob_bind_mb,
+            t_nclob_bind_named_batch,
+            t_nclob_bind_tuple_batch
         ]},
         {rowid_datatypes, [sequence], [
             t_rowid
@@ -325,6 +329,80 @@ t_nclob(Config) ->
     ],
     run_testcases(ConnRef, Table, Key, TestCases).
 
+%% Verifies that the same SQL can first bind NCLOB data as regular small text
+%% and later bind it as large text.  Also verifies batch execution where only a
+%% later row requires the large-text bind format.
+t_nclob_bind_size_changes(Config) ->
+    ConnRef = ?config(conn_ref, Config),
+    Query = "insert into t_nclob_bind_size_changes(C_ID, C_NCLOB) values(:1, :2)",
+    SmallValue = "small",
+    LargeValue = lists:duplicate(5000, $a),
+    %% The same SQL text must work first with a small text bind and then with a
+    %% large text bind, so cursor cache entries include bind format metadata.
+    {ok, [{affected_rows,1}]} = jamdb_oracle:sql_query(ConnRef, {Query, ["small", SmallValue]}),
+    {ok, [{affected_rows,1}]} = jamdb_oracle:sql_query(ConnRef, {Query, ["large", LargeValue]}),
+    assert_count(ConnRef, t_nclob_bind_size_changes, 2),
+    {ok, [{affected_rows,2}]} = jamdb_oracle:sql_query(ConnRef, "delete from t_nclob_bind_size_changes"),
+    ok = jamdb_oracle:reset_cursors(ConnRef),
+    %% Batch metadata must be computed from all rows, not only the first row.
+    {ok, [{affected_rows,2}]} =
+        jamdb_oracle:sql_query(ConnRef, {batch, Query, [["batch-small", SmallValue], ["batch-large", LargeValue]]}),
+    assert_count(ConnRef, t_nclob_bind_size_changes, 2).
+
+%% Verifies that the large-text threshold is based on the encoded byte size,
+%% not the Erlang character count.  This matters for multibyte text that is
+%% shorter than 4000 characters but longer than 4000 encoded bytes.
+t_nclob_bind_mb(Config) ->
+    ConnRef = ?config(conn_ref, Config),
+    Query = "insert into t_nclob_bind_mb(C_ID, C_NCLOB) values(:1, :2)",
+    LargeValue = lists:duplicate(2000, 16#4E00),
+    %% Large text detection must use encoded byte size, not Erlang list length.
+    {ok, [{affected_rows,1}]} =
+        jamdb_oracle:sql_query(ConnRef, {Query, ["large-multibyte", LargeValue]}),
+    assert_count(ConnRef, t_nclob_bind_mb, 1).
+
+%% Verifies named batch binds.  Map values have no SQL order, so the driver
+%% must read placeholder order from the statement before it can merge bind
+%% formats across rows.
+t_nclob_bind_named_batch(Config) ->
+    ConnRef = ?config(conn_ref, Config),
+    Query =
+        "insert into t_nclob_bind_named_batch(C_ID, C_TAG, C_NCLOB) values("
+        ":id, :tag, :payload)",
+    LargeValue = lists:duplicate(5000, $a),
+    %% Named batch binds are map values, so the driver must derive bind order
+    %% from the SQL text before merging per-row bind formats.
+    {ok, [{affected_rows,2}]} =
+        jamdb_oracle:sql_query(
+            ConnRef,
+            {batch, Query, [
+                #{id => "named-batch-1", payload => "small", tag => "small"},
+                #{id => "named-batch-2", payload => LargeValue, tag => "large"}
+            ]}
+        ),
+    assert_count(ConnRef, t_nclob_bind_named_batch, 2).
+
+%% Verifies tuple batch binds.  This path already has positional bind order,
+%% but it still needs merged bind formats when a later batch row contains
+%% large NCLOB data.
+t_nclob_bind_tuple_batch(Config) ->
+    ConnRef = ?config(conn_ref, Config),
+    Query =
+        "insert into t_nclob_bind_tuple_batch(C_ID, C_TAG, C_NCLOB) values("
+        ":1, :2, :3)",
+    LargeValue = lists:duplicate(5000, $a),
+    %% The raw tuple form bypasses map ordering, but still relies on merged
+    %% bind formats when later batch rows contain large text.
+    {ok, [{affected_rows,2}]} =
+        jamdb_oracle:sql_query(
+            ConnRef,
+            {Query,
+                ["tuple-batch-1", "small", "small"],
+                [["tuple-batch-2", "large", LargeValue]],
+                []}
+        ),
+    assert_count(ConnRef, t_nclob_bind_tuple_batch, 2).
+
 t_rowid(Config) ->
     ConnRef = ?config(conn_ref, Config),
     Table = t_rowid,
@@ -393,6 +471,14 @@ table_desc(t_blob) ->
     "C_BLOB BLOB";
 table_desc(t_nclob) ->
     "C_NCLOB NCLOB";
+table_desc(t_nclob_bind_size_changes) ->
+    "C_ID VARCHAR2(32), C_NCLOB NCLOB";
+table_desc(t_nclob_bind_mb) ->
+    "C_ID VARCHAR2(32), C_NCLOB NCLOB";
+table_desc(t_nclob_bind_named_batch) ->
+    "C_ID VARCHAR2(32), C_NCLOB NCLOB, C_TAG VARCHAR2(32)";
+table_desc(t_nclob_bind_tuple_batch) ->
+    "C_ID VARCHAR2(32), C_NCLOB NCLOB, C_TAG VARCHAR2(32)";
 table_desc(t_rowid) ->
     "C_ROWID ROWID".
 
@@ -457,6 +543,17 @@ select(ConnRef, Table) ->
 delete(ConnRef, Table) ->
     Query = lists:concat(["delete from ", Table]),
     jamdb_oracle:sql_query(ConnRef, Query).
+
+assert_count(ConnRef, Table, Expected) ->
+    Query = lists:concat(["select count(*) C_COUNT from ", Table]),
+    {ok, [{result_set, [<<"C_COUNT">>], [], [[{Count}]]}]} = jamdb_oracle:sql_query(ConnRef, Query),
+    Expected = normalize_number(Count),
+    ok.
+
+normalize_number(Number) when is_integer(Number) ->
+    Number;
+normalize_number(Number) when is_float(Number) ->
+    trunc(Number).
 
 %% Temporary wrapper
 format_query(Query, Args) ->
